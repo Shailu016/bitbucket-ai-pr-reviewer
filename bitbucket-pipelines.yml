@@ -1,0 +1,29 @@
+image: nikolaik/python-nodejs:python3.11-nodejs18-slim
+
+options:
+  max-time: 10
+
+pipelines:
+  pull-requests:
+    "**":
+      - step:
+          name: AI Review + Fast Cross-File Linter
+          caches:
+            - node
+            - pip
+          script:
+            # 1. Ultra-fast dependency installation
+            # Using 'ci' instead of 'install' skips dependency resolution.
+            # ignore-scripts skips slow, native C++ builds (like node-sass) which the linter doesn't need anyway.
+            - npm ci --prefer-offline --no-audit --ignore-scripts
+
+            # 2. Run the JS/Vue Linter for cross-file checking
+            - npm run lint > linter_output.txt 2>&1 || true
+            - export LINTER_OUTPUT="$(cat linter_output.txt)"
+
+            # 3. Install Python requirements 
+            - pip install --no-cache-dir requests
+
+            # 4. Run the AI Reviewer
+            - echo "Running AI review on PR $BITBUCKET_PR_ID"
+            - python pr_reviewer.py --block-on-critical
