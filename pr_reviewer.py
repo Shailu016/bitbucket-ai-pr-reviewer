@@ -18,7 +18,6 @@ from requests.exceptions import RequestException, HTTPError
 
 BITBUCKET_API_BASE = "https://api.bitbucket.org/2.0"
 MAX_DIFF_CHARS = 80000
-MAX_LLM_RETRIES = 2
 DIFF_RETRY_DELAY = 5
 
 # Smart Noise Filtering
@@ -31,65 +30,62 @@ EXCLUDED_FILES = {
 
 # Local Secret Scrubbing Patterns
 SECRET_PATTERNS = {
-    "AWS Access Key": r"(?i)(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}",  # noqa: E501
+    "AWS Access Key": r"(?i)(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}",
     "Generic Bearer Token": r"(?i)bearer\s+[a-zA-Z0-9_\-\.]{20,}",
     "RSA Private Key": r"-----BEGIN (RSA|OPENSSH) PRIVATE KEY-----",
-    "GitHub Token": r"(?i)gh[p|u|s|r]_[A-Za-z0-9_]" + r"{36}",
+    "GitHub Token": r"(?i)gh[pousr]_[A-Za-z0-9_]{36,40}",
     "Generic API Key": r"(?i)(api[_-]?key|apikey)\s*[:=]\s*['\"][a-zA-Z0-9]{20,}['\"]",
     "Password in URL": r"(?i)https?://[^:\n\s]+:[^@\n\s]+@[^/\n\s]+",
-    "Slack Webhook": r"https://hooks" + r"\.slack\.com/services/[A-Za-z0-9/]+",
+    "Slack Webhook": r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
+}
+
+# Configurable Heuristics (Replaces hardcoded ground-truth logic)
+GROUND_TRUTH_HEURISTICS = {
+    "reactnativewebview": "Native app bridge/detection timing risk: ensure idempotent checks, as bridge may late-arrive.",
+    "store.commit": "Potential unsafe state mutation in lifecycle: verify guard clauses and awaited actions.",
+    "dispatch": "Potential unsafe state mutation in lifecycle: verify guard clauses and awaited actions.",
+    "updatewindowwidth": "Layout recalculation triggered by window width changes; ensure debounced or guarded to avoid thrash.",
+    "resize": "Layout recalculation triggered by window width changes; ensure debounced or guarded to avoid thrash.",
+    "timezone": "Date/Time formatting across locales could vary; verify locale handling and timezone normalization.",
+    "i18n": "Date/Time formatting across locales could vary; verify locale handling and timezone normalization."
 }
 
 # File size limits for diff processing
 MAX_FILE_DIFF_CHARS = 20000
 MAX_FILES_IN_DIFF = 50
+MAX_CONTEXT_FILES = 5
+MAX_CONTEXT_PER_FILE = 15000
 
+# Strict System Prompts to eliminate AI hallucinated warnings
 SYSTEM_PROMPT = (
-    "You are an elite Senior Code Reviewer. "
-    "You value reliability, security, and performance."
+    "You are an elite, pragmatic Senior Code Reviewer. "
+    "Your goal is to find DEFINITIVE bugs, security flaws, and performance regressions. "
+    "DO NOT act like a linter. DO NOT point out theoretical edge cases unless they represent a high-probability risk. "
+    "If a piece of code is logically sound based on the provided context, assume it works. "
+    "Never use phrases like 'this could potentially' or 'this might'. If you cannot prove it is a bug based on the diff, DO NOT mention it."
 )
 
+# UPDATED: Now mandates a PR Summary format
 REVIEW_PROMPT_TEMPLATE = """
-ROLE: Senior Code Reviewer
-CONTEXT: Reviewing a Pull Request for a production Vue.js/JavaScript application.
+ROLE: Pragmatic Senior Code Reviewer
+CONTEXT: Reviewing a Pull Request for a production application.
 
 Repository: {repo_name}
 Title: {title}
 Author: {author}
 Description: {description}
 
-PROPOSED CHANGES (The Diff):
+PROPOSED CHANGES:
 {diff}
 
-REVIEW CHECKLIST:
-1. BUGS: Logic errors, null/undefined access, off-by-one errors, wrong variable names, incorrect conditions.
-2. BREAKING CHANGES: Does this PR break any existing functionality? Will other files/components that depend on changed code still work correctly?
-3. SYNTAX: Missing brackets, unclosed tags, trailing commas, undefined variables, misspelled identifiers, incorrect imports.
-4. SECURITY: Hardcoded credentials, unvalidated user input, XSS vulnerabilities.
-5. PERFORMANCE: O(N^2) operations, unnecessary re-renders, missing debounce on frequent events.
+FULL FILE CONTEXT:
+{full_context}
 
-CRITICAL RULES:
-- ONLY report issues you are highly confident about. Do NOT guess or speculate.
-- Every issue MUST reference a specific file name and what is wrong. Example: "In `UserCard.vue`, the prop `userName` is accessed but never defined in props."
-- Do NOT give generic advice like 'add logging', 'consider error handling', 'update dependencies', or 'add tests'. Only flag concrete, specific problems visible in the diff.
-- Do NOT comment on code style, formatting, or naming conventions unless they cause actual bugs.
-- If a section has zero issues, write exactly: "None found."
-
-OUTPUT FORMAT:
-- If the code has ZERO issues across all sections, respond EXACTLY with: STATUS: PERFECT
-- Otherwise use this exact Markdown structure:
-
-### 🛑 Critical Blockers
-[Issues that WILL cause bugs, crashes, or broken functionality in production.]
-
-### 🔤 Syntax & Typo Issues
-[Code that will fail to compile or run — missing brackets, undefined variables, import errors.]
-
-### ⚠️ Potential Issues
-[Things that could break under specific conditions. Must be specific — state the exact scenario.]
-
-### 💡 Quick Wins
-[Small, concrete improvements that directly improve the changed code. No generic advice.]
+INSTRUCTIONS:
+1. PR SUMMARY: You MUST start your response with a "### 📝 PR Summary" section containing 2-3 bullet points translating the technical diff into a plain-English summary of what this PR accomplishes (e.g., "Adds user authentication component", "Fixes memory leak in dashboard").
+2. CODE REVIEW: After the summary, provide a "### 🔎 Code Review" section.
+3. In the review section, ONLY report actual, provable bugs or severe security flaws. Ignore stylistic preferences.
+4. If there are no definitive bugs to report, write "**STATUS: PERFECT** 🚀 - No critical issues found." under the Code Review section.
 """
 
 # =========================
@@ -99,10 +95,8 @@ OUTPUT FORMAT:
 class ConfigurationError(Exception):
     pass
 
-
 class APIConnectionError(Exception):
     pass
-
 
 class LLMParsingError(Exception):
     pass
@@ -152,10 +146,9 @@ def with_retries(exceptions: tuple, tries: int = 3, delay: int = 2,
                     logger.warning(warn_msg)
                     time.sleep(mdelay)
                     mdelay *= backoff
-            return func(*args, **kwargs)
+            raise APIConnectionError(f"Retry exhausted for {func.__name__}")
         return wrapper
     return decorator
-
 
 def safe_json_loads(text: str, default: Any = None) -> Any:
     try:
@@ -209,16 +202,21 @@ def _build_llm_request(prompt: str, config: argparse.Namespace) -> Tuple[str, di
         "Authorization": f"Bearer {config.llm_key}", 
         "Content-Type": "application/json"
     }
+    
+    active_model = config.llm_model
+    if len(prompt) > 60000 and config.llm_fallback_model:
+        logger.warning(f"Prompt is very large ({len(prompt)} chars). Switching to fallback model: {config.llm_fallback_model}")
+        active_model = config.llm_fallback_model
+
     body = {
-        "model": config.llm_model,
+        "model": active_model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT}, 
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.0,
+        "temperature": 0.3,
     }
     return url, headers, body
-
 
 @with_retries((RequestException,), tries=3, max_total_time=120)
 def generate_llm_review(prompt: str, config: argparse.Namespace) -> str:
@@ -228,7 +226,7 @@ def generate_llm_review(prompt: str, config: argparse.Namespace) -> str:
     url, headers, body = _build_llm_request(prompt, config)
     last_exception = None
     
-    for attempt in range(MAX_LLM_RETRIES + 1):
+    for attempt in range(4):
         try:
             resp = requests.post(
                 url, headers=headers, json=body, timeout=config.llm_timeout
@@ -259,20 +257,20 @@ def generate_llm_review(prompt: str, config: argparse.Namespace) -> str:
                 
             content = choices[0].get("message", {}).get("content")
             if not content or not isinstance(content, str) or not content.strip():
-                raise LLMParsingError("LLM returned empty or invalid text content.")
+                raise LLMParsingError("LLM Parsing: empty content.")
                 
             return content.strip()
             
         except (LLMParsingError, APIConnectionError) as e:
             last_exception = e
-            if attempt < MAX_LLM_RETRIES:
+            if attempt < 3:
                 wait_time = min(10 * (2 ** attempt), 60)
                 logger.warning(f"LLM error (attempt {attempt + 1}). Retrying in {wait_time}s: {e}")
                 time.sleep(wait_time)
             continue
         except RequestException as e:
             last_exception = APIConnectionError(f"LLM network error: {e}")
-            if attempt < MAX_LLM_RETRIES:
+            if attempt < 3:
                 wait_time = min(10 * (2 ** attempt), 60)
                 logger.warning(f"LLM network error (attempt {attempt + 1}). Retrying in {wait_time}s")
                 time.sleep(wait_time)
@@ -289,7 +287,6 @@ def scan_for_secrets(diff: str) -> List[Dict[str, str]]:
         return []
         
     found_secrets = []
-    # Only scan added lines (+), ignore context and removed lines (-)
     added_lines = "\n".join([line for line in diff.split('\n') if line.startswith('+') and not line.startswith('+++')])
 
     for secret_name, pattern in SECRET_PATTERNS.items():
@@ -304,21 +301,13 @@ def scan_for_secrets(diff: str) -> List[Dict[str, str]]:
 def _parse_diff_header(line: str) -> Optional[Dict[str, str]]:
     if not line.startswith('diff --git'):
         return None
-    
-    parts = line.split(' ')
-    if len(parts) < 3:
+    m = re.match(r"^diff --git a/(.+) b/(.+)$", line)
+    if not m:
         return None
-    
-    file_path = parts[-1]
+    file_path = m.group(1)
     file_name = file_path.split('/')[-1]
     ext = os.path.splitext(file_name)[1].lower()
-    
-    return {
-        'path': file_path,
-        'name': file_name,
-        'ext': ext,
-    }
-
+    return {'path': file_path, 'name': file_name, 'ext': ext}
 
 def _count_diff_stats(raw_diff: str) -> Dict[str, int]:
     file_count = 0
@@ -326,7 +315,6 @@ def _count_diff_stats(raw_diff: str) -> Dict[str, int]:
         if line.startswith('diff --git'):
             file_count += 1
     return {'files': file_count}
-
 
 def filter_noise_from_diff(raw_diff: str) -> str:
     if not raw_diff or not isinstance(raw_diff, str):
@@ -344,9 +332,7 @@ def filter_noise_from_diff(raw_diff: str) -> str:
         header = _parse_diff_header(line)
         if header:
             current_file_chars = 0
-            
             if header['ext'] in EXCLUDED_EXTENSIONS or header['name'] in EXCLUDED_FILES:
-                logger.debug(f"Filtering out noisy file: {header['name']}")
                 skip_current_file = True
             else:
                 skip_current_file = False
@@ -355,8 +341,8 @@ def filter_noise_from_diff(raw_diff: str) -> str:
             continue
         
         if current_file_chars > MAX_FILE_DIFF_CHARS:
-            if not filtered_lines or filtered_lines[-1] != f"\n... [WARNING: FILE TRUNCATED ({MAX_FILE_DIFF_CHARS} char limit)]":
-                filtered_lines.append(f"\n... [WARNING: FILE TRUNCATED ({MAX_FILE_DIFF_CHARS} char limit)]")
+            if not filtered_lines or filtered_lines[-1] != f"... [WARNING: FILE TRUNCATED ({MAX_FILE_DIFF_CHARS} chars)]":
+                filtered_lines.append(f"... [WARNING: FILE TRUNCATED ({MAX_FILE_DIFF_CHARS} chars)]")
             continue
         
         current_file_chars += len(line) + 1
@@ -369,7 +355,7 @@ def post_pr_comment(base_url: str, auth: tuple,
     logger.info("Posting new AI review comment...")
     comments_url = f"{base_url}/comments"
     payload = {
-        "content": {"raw": f"### :robot_face: AI Code Review\n\n{review_text}"}
+        "content": {"raw": f"{review_text}"} # Removed robot face prefix here, as it's handled by the LLM template now
     }
     
     try:
@@ -377,75 +363,97 @@ def post_pr_comment(base_url: str, auth: tuple,
     except APIConnectionError as e:
         logger.error(f"Failed to post comment to Bitbucket: {e}")
 
-def build_review_prompt(pr: dict, diff: str, linter_errors: str = "") -> str:
+def generate_ground_truth(pr: dict, diff: str, full_context: str) -> str:
+    issues = set()
+    d_lower = (diff or "").lower()
+    ctx_lower = (full_context or "").lower()
+
+    for keyword, warning in GROUND_TRUTH_HEURISTICS.items():
+        if keyword in d_lower or keyword in ctx_lower:
+            issues.add(f"- {warning}")
+
+    if "ghp_" in ctx_lower or "bearer" in ctx_lower:
+        issues.add("- Potential secrets leakage in full context; ensure secret scrubbing is comprehensive.")
+
+    if not issues:
+        return ""
+    
+    return "GROUND-TRUTH HEURISTICS DETECTED:\n" + "\n".join(issues)
+
+# =========================
+# Context Fetching
+# =========================
+
+def safe_truncate(text: str, max_chars: int, truncation_msg: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    cut_index = text.rfind('\n', 0, max_chars)
+    if cut_index == -1:
+        cut_index = max_chars  
+    return text[:cut_index] + f"\n\n... {truncation_msg}"
+
+def fetch_file_content(workspace: str, repo_slug: str, commit_hash: str, file_path: str, auth: tuple, timeout: int = 30) -> str:
+    url = f"{BITBUCKET_API_BASE}/repositories/{workspace}/{repo_slug}/src/{commit_hash}/{file_path}"
+    resp = requests.get(url, auth=auth, timeout=timeout)
+    if resp.ok:
+        return resp.text
+    return ""
+
+def build_review_prompt(pr: dict, diff: str, linter_errors: str = "", full_context: str = "") -> str:
     if not diff or not isinstance(diff, str):
         diff = ""
-        
-    if len(diff) > MAX_DIFF_CHARS:
-        logger.warning("Diff exceeds maximum threshold. Truncating.")
-        diff = diff[:MAX_DIFF_CHARS] + "\n\n... [WARNING: DIFF TRUNCATED]"
-        
     dest_repo = pr.get("destination", {}).get("repository", {})
     base_prompt = REVIEW_PROMPT_TEMPLATE.format(
         repo_name=dest_repo.get("full_name", "Unknown"),
         title=pr.get("title", "Untitled"),
         author=pr.get("author", {}).get("display_name", "Unknown"),
         description=(pr.get("description") or "(none)").strip(),
+        full_context=full_context,
         diff=diff
-    ).strip()
+    )
+    base_prompt = base_prompt.strip()
+
+    ground_truth = generate_ground_truth(pr, diff, full_context)
+    if ground_truth:
+        base_prompt += "\n\n" + ground_truth
 
     if linter_errors and isinstance(linter_errors, str) and linter_errors.strip():
-        safe_linter = linter_errors.strip()
-
-        # If the linter passed with no errors, skip injecting noise
-        if "No lint errors found!" in safe_linter:
-            logger.info("Linter passed cleanly. No cross-file issues.")
+        safe = linter_errors.strip()
+        if "No lint errors found" in safe:
             return base_prompt
-
-        # Filter out npm noise — keep only actual error lines
+            
         noise_keywords = [
             "npm warn", "npm WARN", "npx", "browserslist", "caniuse-lite",
             "update-browserslist", "Why you should", "https://github.com",
-            "DONE ", "lint", "vue-cli-service", "@", ">",
+            "DONE ", "lint", "vue-cli-service", "@", ">"
         ]
         error_lines = []
-        for line in safe_linter.split('\n'):
+        for line in safe.split('\n'):
             stripped = line.strip()
-            if not stripped:
-                continue
-            if any(noise in stripped for noise in noise_keywords):
+            if not stripped or any(n in stripped for n in noise_keywords):
                 continue
             error_lines.append(stripped)
-
-        # If after filtering there are no real errors, skip injection
-        if not error_lines:
-            logger.info("Linter output was only warnings/noise. Skipping.")
-            return base_prompt
-
-        if len(error_lines) > 200:
-            logger.warning("Too many linter errors. Truncating to 200.")
-            error_lines = error_lines[:200]
-
-        formatted_errors = "\n".join(f"- {line}" for line in error_lines)
-
-        logger.info(f"Injecting {len(error_lines)} real linter errors into prompt.")
-        cross_file_context = f"""
-
-### 🚨 CROSS-FILE ISSUES (from JS/Vue Linter) 🚨
-The following errors were found by running the project's linter AFTER applying this PR's changes.
-These errors may exist in files NOT shown in the diff — meaning this PR may have broken something elsewhere.
-
-{formatted_errors}
-
-INSTRUCTIONS FOR CROSS-FILE ISSUES:
-- For each error above, explain in plain English what broke and which file is affected.
-- If the error was clearly caused by changes in this PR's diff, put it in "🛑 Critical Blockers".
-- If the error existed before this PR (pre-existing issue), briefly note it but do NOT block the PR.
-- Format each finding as: **[file:line]** — clear one-sentence explanation of what is broken.
-"""
-        return base_prompt + cross_file_context
+            
+        if error_lines:
+            formatted = "\n- ".join(error_lines)
+            base_prompt += "\n\n### LINTER FINDINGS\n- " + formatted
 
     return base_prompt
+
+def fetch_context_for_changes(workspace: str, repo_slug: str, source_commit: str, changed_paths: List[str], auth: tuple) -> str:
+    parts: List[str] = []
+    for i, path in enumerate(changed_paths):
+        if i >= MAX_CONTEXT_FILES:
+            break
+        content = fetch_file_content(workspace, repo_slug, source_commit, path, auth, timeout=30)
+        if not content:
+            continue
+            
+        if len(content) > MAX_CONTEXT_PER_FILE:
+            content = safe_truncate(content, MAX_CONTEXT_PER_FILE, "[TRUNCATED FILE CONTEXT TO PREVENT TOKEN OVERFLOW]")
+            
+        parts.append(f"--- FILE: {path} ---\n{content}")
+    return "\n\n".join(parts)
 
 # =========================
 # Orchestration
@@ -467,6 +475,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--llm-key", default=os.getenv("LLM_API_KEY"))
     parser.add_argument("--llm-base", default=os.getenv("LLM_API_BASE", "https://api.openai.com/v1"))
     parser.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    parser.add_argument("--llm-fallback-model", default=os.getenv("LLM_FALLBACK_MODEL", "gpt-4o"))
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     
     is_blocking = os.getenv("BLOCK_ON_CRITICAL", "false").lower() == "true"
@@ -499,7 +508,7 @@ def main() -> int:
         linter_errors = os.getenv("LINTER_OUTPUT", "").strip()
         
         if not all([workspace, repo_slug, pr_id]):
-            logger.info("BITBUCKET_PR_ID missing. Skipping PR Review.")
+            logger.info("BITBUCKET_PR_ID missing. Skipping review.")
             return 0
 
         auth = (os.getenv("BITBUCKET_USER"), os.getenv("BITBUCKET_APP_PASSWORD"))
@@ -510,10 +519,9 @@ def main() -> int:
         
         raw_diff = bitbucket_request("GET", f"{base_url}/diff", auth, args.api_timeout)
         if not raw_diff or not isinstance(raw_diff, str) or not raw_diff.strip():
-            logger.info("Diff is empty. Waiting 5 seconds...")
+            logger.info("Diff is empty or unavailable. Waiting 5 seconds...")
             time.sleep(5)
             raw_diff = bitbucket_request("GET", f"{base_url}/diff", auth, args.api_timeout)
-            
             if not raw_diff or not isinstance(raw_diff, str) or not raw_diff.strip():
                 logger.warning("PR diff is permanently empty. Skipping analysis.")
                 return 0
@@ -523,33 +531,52 @@ def main() -> int:
             logger.info("Diff contained only noisy files. Skipping AI analysis.")
             return 0
 
-        found_secrets = scan_for_secrets(clean_diff)
-        if found_secrets:
-            secret_types = list(set(s['type'] for s in found_secrets))
-            secrets_str = ', '.join(secret_types)
-            logger.error(f"🚨 HARDCODED SECRETS DETECTED: {secrets_str}. Blocking LLM.")
-            warning_msg = (
-                "### 🚨 CRITICAL SECURITY ALERT 🚨\n\n"
-                f"Hardcoded secrets detected: `{secrets_str}`\n\n"
-                "**AI review aborted.** Please remove all secrets before proceeding.\n\n"
-                "#### Details:\n"
-                + "\n".join(f"- **{s['type']}**: `{s['line_preview']}...`" for s in found_secrets[:10])
-            )
-            post_pr_comment(base_url, auth, args.api_timeout, warning_msg)
-            return 1
+        # --- Active Secret Scanning Integration ---
+        secrets = scan_for_secrets(clean_diff)
+        if secrets:
+            logger.error(f"❌ {len(secrets)} Secrets detected in diff! Failing pipeline immediately.")
+            secret_details = "\n".join([f"- **{s['type']}**: `{s['line_preview']}...`" for s in secrets])
+            secret_msg = f"### 🛑 CRITICAL SECURITY RISK\n\nHardcoded secrets detected in this PR. Please rotate these credentials immediately and remove them from the commit history:\n{secret_details}"
+            post_pr_comment(base_url, auth, args.api_timeout, secret_msg)
+            return 1  
 
-        prompt = build_review_prompt(pr_details, clean_diff, linter_errors)
+        changed_paths: List[str] = []
+        if workspace and repo_slug:
+            source_commit = pr_details.get("source", {}).get("commit", {}).get("hash", "")
+            for line in raw_diff.splitlines():
+                header = _parse_diff_header(line)
+                if header:
+                    if header["ext"] in EXCLUDED_EXTENSIONS or header["name"] in EXCLUDED_FILES:
+                        continue
+                    changed_paths.append(header["path"])
+            
+            seen = set()
+            unique_changed = []
+            for p in changed_paths:
+                if p not in seen:
+                    unique_changed.append(p)
+                    seen.add(p)
+
+            full_context = ""
+            if source_commit:
+                full_context = fetch_context_for_changes(
+                    workspace, repo_slug, source_commit, unique_changed[:MAX_CONTEXT_FILES], auth
+                )
+        else:
+            full_context = ""
+
+        prompt = build_review_prompt(pr_details, clean_diff, linter_errors, full_context=full_context)
+        
+        logger.info("Generating LLM review...")
         review = generate_llm_review(prompt, args)
 
+        # UPDATED: Post the dynamically generated review (which now includes the Summary)
         if "STATUS: PERFECT" in review:
-            logger.info("AI Verdict: Perfect. Posting approval comment.")
-            approval_msg = (
-                "**STATUS: PERFECT** 🚀\n\n"
-                "No critical blockers or edge cases found. Great work!"
-            )
-            post_pr_comment(base_url, auth, args.api_timeout, approval_msg)
+            logger.info("AI Verdict: Perfect. Posting summary and approval comment.")
         else:
-            post_pr_comment(base_url, auth, args.api_timeout, review)
+            logger.info("AI Verdict: Issues found. Posting summary and review comment.")
+            
+        post_pr_comment(base_url, auth, args.api_timeout, review)
 
         if args.block_on_critical:
             blockers = re.search(r'### 🛑 Critical Blockers(.*?)(###|$)', review, re.DOTALL)
